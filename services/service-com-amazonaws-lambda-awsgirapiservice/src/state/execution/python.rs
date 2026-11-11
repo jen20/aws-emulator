@@ -197,8 +197,18 @@ const SUPPLIED_MODULES: &[&str] = &[HOST_MODULE, "posix"];
 /// dominate the run; the RUN's own memory is sampled at every event ([`Bounds::step`]).
 const STEPS_BETWEEN_PROCESS_SAMPLES: u64 = 2_048;
 
+/// The size of a page of this process's memory, when the host will not say.
+const DEFAULT_PAGE_BYTES: u64 = 4_096;
+
 /// The size of a page of this process's memory, which the faulted-page count is scaled by.
-const PAGE_BYTES: u64 = 4_096;
+///
+/// The host decides it: Apple silicon uses 16 KiB pages and some Linux arm64 kernels use 64 KiB.
+fn page_bytes() -> u64 {
+    match ::nix::unistd::sysconf(::nix::unistd::SysconfVar::PAGE_SIZE) {
+        Ok(Some(size)) => u64::try_from(size).unwrap_or(DEFAULT_PAGE_BYTES),
+        _ => DEFAULT_PAGE_BYTES,
+    }
+}
 
 /// The resident size this WHOLE process may reach while a handler is running, whatever any
 /// one run has added.
@@ -463,6 +473,12 @@ fn prepare(
     install_environment(vm, request.environment)?;
     refuse_guest_threads(vm)?;
     clamp_guest_sleep(vm, bounds)?;
+    // A handler runs on Lambda's Linux, whatever this emulator is built on. The standard
+    // library branches on `sys.platform` (`urllib` imports the macOS `_scproxy` on
+    // `darwin`), so the guest sees the platform it runs on, not the host's.
+    vm.sys_module
+        .as_object()
+        .set_attr("platform", vm.ctx.new_str("linux"), vm)?;
     // Put the host module in `sys.modules` under the name the runtime source imports it
     // by. The import machinery answers from there first, and the name is NOT in the native
     // module table ([`ALLOWED_NATIVE_MODULES`]), so there is no other module of that name
@@ -1487,11 +1503,19 @@ impl Bounds {
 }
 
 /// How many bytes of memory THIS thread has faulted in, as the host reports it.
+///
+/// Linux reports faults per thread. macOS has no per-thread fault count, so there the figure
+/// covers the whole process: a run then also counts faults made by other runs at the same
+/// time, which can stop a run earlier than its own ceiling would.
 fn faulted_bytes() -> u64 {
-    match ::nix::sys::resource::getrusage(::nix::sys::resource::UsageWho::RUSAGE_THREAD) {
+    #[cfg(target_os = "linux")]
+    let scope = ::nix::sys::resource::UsageWho::RUSAGE_THREAD;
+    #[cfg(not(target_os = "linux"))]
+    let scope = ::nix::sys::resource::UsageWho::RUSAGE_SELF;
+    match ::nix::sys::resource::getrusage(scope) {
         Ok(usage) => {
             let pages = usage.minor_page_faults().saturating_add(usage.major_page_faults());
-            u64::try_from(pages).unwrap_or(0).saturating_mul(PAGE_BYTES)
+            u64::try_from(pages).unwrap_or(0).saturating_mul(page_bytes())
         }
         Err(_) => 0,
     }
